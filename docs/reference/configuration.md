@@ -138,6 +138,52 @@ label(if(current_working_copy, "bold"),
 '''
 ```
 
+## Commit Signing
+
+`jj spr` creates synthetic commits on your behalf (the pull request commit and,
+for stacked or rebased changes, `[spr] …` base-branch commits) and pushes them
+directly to GitHub. When you have commit signing configured in Jujutsu, jj-spr
+signs these commits with the same key, so they satisfy forge rules such as
+GitHub's "require signed commits" and show up as verified.
+
+Signing is driven entirely by Jujutsu's native [`[signing]`
+configuration][jj-signing] — there is no separate jj-spr setting:
+
+```toml
+[signing]
+backend = "gpg"          # "gpg" or "ssh"
+key = "SADFKJSDF872341"  # gpg key id, or ssh key / path
+behavior = "own"
+```
+
+jj-spr mirrors Jujutsu's own signing decision based on `signing.behavior`:
+
+| `signing.behavior` | Are jj-spr's commits signed?                                        |
+| ------------------ | ------------------------------------------------------------------- |
+| `own`              | Yes, when the commit's author email matches your `user.email`       |
+| `force`            | Yes, always                                                         |
+| `keep` (default)   | No — `keep` only preserves existing signatures, and these commits are new |
+| `drop`             | No                                                                  |
+
+Notes:
+- **Backends:** `gpg` and `ssh` are supported. `signing.backends.gpg.program`
+  (default `gpg`) and `signing.backends.ssh.program` (default `ssh-keygen`) are
+  honored.
+- **`signing.key` is required** when a commit is going to be signed.
+- **`signing.sign-all` is ignored**, matching Jujutsu (≥ 0.42), which determines
+  signing from `signing.behavior` alone.
+- **Failures abort the command.** If signing is configured but fails (for
+  example the key is missing, or the backend is one jj-spr can't use), the
+  command stops with an error rather than pushing an unsigned commit.
+- **`own` and base-branch commits:** under `own`, a `[spr] …` base-branch commit
+  is only signed when its inherited author email matches your `user.email`. If a
+  base commit is derived from someone else's commit on the master branch it won't
+  be signed; use `behavior = "force"` if you need every pushed commit signed.
+- Showing as **Verified** on GitHub additionally requires the signing key to be
+  registered with your GitHub account.
+
+[jj-signing]: https://docs.jj-vcs.dev/latest/config/#commit-signing
+
 ## Environment Variables
 
 jj-spr also respects certain environment variables:

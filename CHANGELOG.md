@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - jj-spr now works in workspaces that aren't colocated.
 - The first commit in a pull reuqest now uses the local commit's description.
+- The commits jj-spr creates and pushes on your behalf are now signed when commit
+  signing is configured in Jujutsu (`[signing]`), honoring `signing.behavior`
+  (`own`/`force`) for both the GPG and SSH backends.
 
 ## [0.1.0] - 2025-11-15
 

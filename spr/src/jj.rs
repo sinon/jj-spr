@@ -17,6 +17,7 @@ use crate::{
     message::{MessageSection, MessageSectionsMap, build_commit_message, parse_message},
 };
 use git2::Oid;
+use git2_ext::ops::{GpgSign, Sign, SshSign};
 
 #[derive(Debug, Clone)]
 pub enum DryRunAction {
@@ -46,10 +47,128 @@ pub struct PreparedCommit {
     pub dry_run_action: Option<DryRunAction>,
 }
 
+// ==============================================================================
+// Commit signing
+// ==============================================================================
+//
+// `jj spr` creates synthetic ("virtual") commits on the user's behalf — the PR
+// head commit and the `[spr] …` base-branch commits — and pushes them straight
+// to GitHub. To respect forge rules such as "require signed commits", these
+// commits must be signed with the same key jj itself would use.
+//
+// jj stores signing configuration in its own (TOML) config under `[signing]`,
+// *not* in git config, so we read it via `jj config get` and replicate jj's own
+// signing decision (see `lib/src/settings.rs::SignSettings::should_sign` in the
+// jj source). The actual signature is produced by `git2_ext`, which shells out
+// to `gpg`/`ssh-keygen` and embeds a standard git `gpgsig` header.
+
+/// Mirror of jj's `SignBehavior` (`signing.behavior`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignBehavior {
+    /// Never sign.
+    Drop,
+    /// Only re-sign commits that are *already* signed. Since the commits spr
+    /// creates are brand new and never carry an inherited signature, `Keep`
+    /// effectively means "do not sign" for our purposes.
+    Keep,
+    /// Sign commits authored by the current user.
+    Own,
+    /// Always sign.
+    Force,
+}
+
+impl SignBehavior {
+    fn parse(value: &str) -> Self {
+        match value.trim() {
+            "drop" => Self::Drop,
+            "own" => Self::Own,
+            "force" => Self::Force,
+            // `keep` is jj's default when a backend is configured; treat any
+            // unknown/unreadable value the same way, which is the safe
+            // (non-signing) choice for freshly created commits.
+            _ => Self::Keep,
+        }
+    }
+}
+
+/// Which backend (and concrete program + key) to sign a commit with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignerKind {
+    Gpg { program: String, key: String },
+    Ssh { program: String, key: String },
+}
+
+/// The outcome of applying jj's signing rules to a single commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignDecision {
+    DoNotSign,
+    Sign(SignerKind),
+}
+
+/// jj signing configuration, resolved once from `jj config`.
+#[derive(Debug, Clone)]
+struct SigningSettings {
+    /// The configured backend, or `None` when signing is disabled
+    /// (`signing.backend` is `none` or unset).
+    backend: Option<String>,
+    behavior: SignBehavior,
+    key: Option<String>,
+    /// `user.email`, used to decide ownership for the `Own` behavior.
+    user_email: String,
+    gpg_program: String,
+    ssh_program: String,
+}
+
+impl SigningSettings {
+    /// Decide whether (and how) to sign a commit with the given author email,
+    /// faithfully replicating jj's `should_sign` logic.
+    ///
+    /// Returns an error when signing is required but cannot be performed (no key
+    /// configured, or an unsupported backend), so the command hard-fails rather
+    /// than silently pushing an unsigned commit a forge would reject.
+    fn decide(&self, author_email: &str) -> Result<SignDecision> {
+        let Some(backend) = self.backend.as_deref() else {
+            return Ok(SignDecision::DoNotSign);
+        };
+
+        let should_sign = match self.behavior {
+            SignBehavior::Drop | SignBehavior::Keep => false,
+            SignBehavior::Own => author_email == self.user_email,
+            SignBehavior::Force => true,
+        };
+
+        if !should_sign {
+            return Ok(SignDecision::DoNotSign);
+        }
+
+        let key = self.key.clone().ok_or_else(|| {
+            Error::new(
+                "Commit signing is enabled in jj (signing.behavior) but signing.key is not set"
+                    .to_string(),
+            )
+        })?;
+
+        match backend {
+            "gpg" => Ok(SignDecision::Sign(SignerKind::Gpg {
+                program: self.gpg_program.clone(),
+                key,
+            })),
+            "ssh" => Ok(SignDecision::Sign(SignerKind::Ssh {
+                program: self.ssh_program.clone(),
+                key,
+            })),
+            other => Err(Error::new(format!(
+                "Unsupported jj signing backend '{other}': jj-spr can sign with 'gpg' or 'ssh'"
+            ))),
+        }
+    }
+}
+
 pub struct Jujutsu {
     repo_path: PathBuf,
     jj_bin: PathBuf,
     pub git_repo: git2::Repository,
+    signing: SigningSettings,
 }
 
 impl Jujutsu {
@@ -57,11 +176,27 @@ impl Jujutsu {
         let jj_bin = get_jj_bin();
         let workspace_root = discover_workspace_root(&jj_bin, &current_path)?;
         let git_repo = find_git_repo(&workspace_root)?;
+        let signing = resolve_signing_settings(&jj_bin, &workspace_root);
 
         Ok(Self {
             repo_path: workspace_root,
             jj_bin,
             git_repo,
+            signing,
+        })
+    }
+
+    /// Build the signer for a derived commit with the given author email, or
+    /// `None` if jj's signing rules say this commit should not be signed.
+    fn build_signer(&self, author_email: &str) -> Result<Option<Box<dyn Sign>>> {
+        Ok(match self.signing.decide(author_email)? {
+            SignDecision::DoNotSign => None,
+            SignDecision::Sign(SignerKind::Gpg { program, key }) => {
+                Some(Box::new(GpgSign::new(program, key)))
+            }
+            SignDecision::Sign(SignerKind::Ssh { program, key }) => {
+                Some(Box::new(SshSign::new(program, key)))
+            }
         })
     }
 
@@ -200,9 +335,22 @@ impl Jujutsu {
             String::from_utf8_lossy(original_commit.author().email_bytes()).as_ref(),
         )?;
 
-        Ok(self
-            .git_repo
-            .commit(None, &author, &committer, message, &tree, &parent_refs)?)
+        // Sign the derived commit when jj's signing configuration calls for it,
+        // so the commits spr pushes on the user's behalf satisfy forge signing
+        // rules. The author email drives the `Own` ownership check.
+        let author_email =
+            String::from_utf8_lossy(original_commit.author().email_bytes()).into_owned();
+        let signer = self.build_signer(&author_email)?;
+
+        Ok(git2_ext::ops::commit(
+            &self.git_repo,
+            &author,
+            &committer,
+            message,
+            &tree,
+            &parent_refs,
+            signer.as_deref(),
+        )?)
     }
 
     pub fn cherrypick(&self, commit_oid: Oid, onto_oid: Oid) -> Result<git2::Index> {
@@ -368,6 +516,57 @@ fn get_jj_bin() -> PathBuf {
     std::env::var_os("JJ").map_or_else(|| "jj".into(), |v| v.into())
 }
 
+/// Read a single string value from jj's config (`jj config get <key>`), run in
+/// the workspace so repo/user/workspace config layers are all honored.
+///
+/// Returns `None` when the key is unset (jj exits non-zero) or empty.
+fn get_jj_config_string(jj_bin: &Path, repo_path: &Path, key: &str) -> Option<String> {
+    let output = Command::new(jj_bin)
+        .args(["config", "get", key])
+        .current_dir(repo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// Resolve jj's `[signing]` configuration once, mirroring the keys jj itself
+/// consults (`signing.backend`, `signing.behavior`, `signing.key`) plus the
+/// per-backend program. `signing.sign-all` is intentionally ignored because jj
+/// (>= 0.42) no longer consults it — `signing.behavior` is the source of truth.
+fn resolve_signing_settings(jj_bin: &Path, repo_path: &Path) -> SigningSettings {
+    let get = |key: &str| get_jj_config_string(jj_bin, repo_path, key);
+
+    // `signing.backend` defaults to "none"; treat that (and an unset value) as
+    // signing disabled.
+    let backend = get("signing.backend").filter(|b| b != "none");
+
+    let behavior = get("signing.behavior")
+        .map(|value| SignBehavior::parse(&value))
+        .unwrap_or(SignBehavior::Keep);
+
+    SigningSettings {
+        backend,
+        behavior,
+        key: get("signing.key"),
+        user_email: get("user.email").unwrap_or_default(),
+        gpg_program: get("signing.backends.gpg.program").unwrap_or_else(|| "gpg".to_owned()),
+        ssh_program: get("signing.backends.ssh.program").unwrap_or_else(|| "ssh-keygen".to_owned()),
+    }
+}
+
 /// Discover the Jujutsu workspace root from the given directory by running `jj root`.
 fn discover_workspace_root(jj_bin: &PathBuf, current_dir: &Path) -> Result<PathBuf> {
     let output = Command::new(jj_bin)
@@ -491,6 +690,13 @@ mod tests {
 
         let _ = std::process::Command::new("jj")
             .args(["config", "set", "--repo", "user.email", "test@example.com"])
+            .current_dir(&repo_path)
+            .output();
+
+        // Ensure tests never attempt real signing, regardless of the developer's
+        // user-level jj config (which may enable gpg/ssh signing).
+        let _ = std::process::Command::new("jj")
+            .args(["config", "set", "--repo", "signing.backend", "none"])
             .current_dir(&repo_path)
             .output();
 
@@ -690,6 +896,111 @@ mod tests {
         assert!(
             derived_committer_time.seconds() > original_committer_time.seconds(),
             "Derived commit committer timestamp should be newer than original"
+        );
+    }
+
+    // ==========================================================================
+    // Signing decision logic
+    // ==========================================================================
+
+    fn signing_settings(
+        backend: Option<&str>,
+        behavior: SignBehavior,
+        key: Option<&str>,
+    ) -> SigningSettings {
+        SigningSettings {
+            backend: backend.map(str::to_owned),
+            behavior,
+            key: key.map(str::to_owned),
+            user_email: "me@example.com".to_owned(),
+            gpg_program: "gpg".to_owned(),
+            ssh_program: "ssh-keygen".to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_sign_behavior_parse() {
+        assert_eq!(SignBehavior::parse("drop"), SignBehavior::Drop);
+        assert_eq!(SignBehavior::parse("keep"), SignBehavior::Keep);
+        assert_eq!(SignBehavior::parse("own"), SignBehavior::Own);
+        assert_eq!(SignBehavior::parse("force"), SignBehavior::Force);
+        assert_eq!(SignBehavior::parse("  own  "), SignBehavior::Own);
+        // Unknown/unreadable values fall back to the safe non-signing default.
+        assert_eq!(SignBehavior::parse("nonsense"), SignBehavior::Keep);
+    }
+
+    #[test]
+    fn test_decide_no_backend_never_signs() {
+        let settings = signing_settings(None, SignBehavior::Force, Some("KEY"));
+        assert_eq!(
+            settings.decide("me@example.com").unwrap(),
+            SignDecision::DoNotSign
+        );
+    }
+
+    #[test]
+    fn test_decide_drop_and_keep_never_sign() {
+        for behavior in [SignBehavior::Drop, SignBehavior::Keep] {
+            let settings = signing_settings(Some("gpg"), behavior, Some("KEY"));
+            assert_eq!(
+                settings.decide("me@example.com").unwrap(),
+                SignDecision::DoNotSign,
+                "{behavior:?} should not sign a fresh commit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_own_signs_only_matching_author() {
+        let settings = signing_settings(Some("gpg"), SignBehavior::Own, Some("KEY"));
+        assert_eq!(
+            settings.decide("me@example.com").unwrap(),
+            SignDecision::Sign(SignerKind::Gpg {
+                program: "gpg".to_owned(),
+                key: "KEY".to_owned(),
+            })
+        );
+        assert_eq!(
+            settings.decide("someone-else@example.com").unwrap(),
+            SignDecision::DoNotSign
+        );
+    }
+
+    #[test]
+    fn test_decide_force_always_signs() {
+        let settings = signing_settings(Some("ssh"), SignBehavior::Force, Some("KEY"));
+        assert_eq!(
+            settings.decide("someone-else@example.com").unwrap(),
+            SignDecision::Sign(SignerKind::Ssh {
+                program: "ssh-keygen".to_owned(),
+                key: "KEY".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_decide_missing_key_is_error_when_signing_required() {
+        let settings = signing_settings(Some("gpg"), SignBehavior::Force, None);
+        assert!(settings.decide("me@example.com").is_err());
+
+        // ...but a missing key is fine when we would not sign anyway.
+        let settings = signing_settings(Some("gpg"), SignBehavior::Keep, None);
+        assert_eq!(
+            settings.decide("me@example.com").unwrap(),
+            SignDecision::DoNotSign
+        );
+    }
+
+    #[test]
+    fn test_decide_unsupported_backend_is_error_when_signing_required() {
+        let settings = signing_settings(Some("gpgsm"), SignBehavior::Force, Some("KEY"));
+        assert!(settings.decide("me@example.com").is_err());
+
+        // An unsupported backend is harmless when no signing is required.
+        let settings = signing_settings(Some("gpgsm"), SignBehavior::Drop, Some("KEY"));
+        assert_eq!(
+            settings.decide("me@example.com").unwrap(),
+            SignDecision::DoNotSign
         );
     }
 }
